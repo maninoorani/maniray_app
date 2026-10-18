@@ -1,0 +1,103 @@
+name: Build ManiRay APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+
+      - name: Checkout upstream v2rayNG (pinned)
+        uses: actions/checkout@v7
+        with:
+          repository: 2dust/v2rayNG
+          ref: 6fe3893bfd37865dc677111fa48aef14c0a41efd
+          path: upstream
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Apply ManiRay changes
+        run: |
+          python3 patch.py upstream "$(tr -d '\r\n ' < panel_url.txt)"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          log-accepted-android-sdk-licenses: false
+          cmdline-tools-version: '14742923'
+          packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
+
+      - name: Install NDK
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --channel=0 --install "ndk;30.0.16248370"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> $GITHUB_ENV
+          sed -i '10i\
+          \
+              ndkVersion = "30.0.16248370"' upstream/V2rayNG/app/build.gradle.kts
+
+      - name: Build libhevtun
+        run: |
+          cd upstream
+          bash compile-hevtun.sh
+          cp -r libs V2rayNG/app
+
+      - name: Download libv2ray.aar
+        run: |
+          cd upstream/AndroidLibXrayLite
+          TAG=$(git describe --tags --abbrev=0 || true)
+          echo "Submodule tag: '$TAG'"
+          cd ../V2rayNG/app
+          mkdir -p libs
+          if [ -n "$TAG" ] && curl -fL "https://github.com/2dust/AndroidLibXrayLite/releases/download/$TAG/libv2ray.aar" -o libs/libv2ray.aar; then
+            echo "Downloaded tag $TAG"
+          else
+            echo "Falling back to latest release"
+            curl -fL "https://github.com/2dust/AndroidLibXrayLite/releases/latest/download/libv2ray.aar" -o libs/libv2ray.aar
+          fi
+          ls -la libs
+
+      - name: Setup Java
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Prepare signing key (created once, then reused)
+        run: |
+          if [ ! -f keystore.b64 ]; then
+            keytool -genkeypair -keystore $RUNNER_TEMP/gen.jks -alias maniray -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass ManiRay2026 -keypass ManiRay2026 -dname "CN=ManiRay, O=ManiRay, C=IR"
+            base64 -w0 $RUNNER_TEMP/gen.jks > keystore.b64
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git add keystore.b64
+            git commit -m "Add signing key"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+          base64 -d keystore.b64 > $RUNNER_TEMP/maniray.jks
+
+      - name: Build APK
+        run: |
+          cd upstream/V2rayNG
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          chmod 755 gradlew
+          ./gradlew assemblePlaystoreRelease --stacktrace \
+            -Pandroid.injected.signing.store.file=$RUNNER_TEMP/maniray.jks \
+            -Pandroid.injected.signing.store.password=ManiRay2026 \
+            -Pandroid.injected.signing.key.alias=maniray \
+            -Pandroid.injected.signing.key.password=ManiRay2026
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: ManiRay-APK
+          path: upstream/V2rayNG/app/build/outputs/apk/playstore/release/*.apk
