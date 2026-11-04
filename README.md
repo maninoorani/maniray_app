@@ -1,1 +1,0 @@
-# maniray_app
